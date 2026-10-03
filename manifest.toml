@@ -1,0 +1,158 @@
+schema_version = 1
+plugin_name = "spatial"
+
+[image]
+reference = "localhost/autonomics/biotools-py@sha256:21e14c1582a9d4c261c0a23a11864293313ee2b49b9b7d85bcabc89210b48c7e"
+tag = "v1"
+upstream = "h5py + pyarrow + pyimzML + scikit-learn"
+license = "BSD-3-Clause"
+
+# 说明：空间组学家族（方案 §15.5 B-S）。覆盖 Xenium（10x 格式 h5 + cells 表）
+# 与 imzML 空间代谢两类的最小摄取与统计层。解释边界统一遵守 §15.5：
+# 独立单位是供者；器官、切片、像素嵌套；本家族节点全部为"切片内"统计，
+# 跨供者汇总与置换限制在下游/上游完成，节点不做跨供者推断。
+
+[[nodes]]
+kind = "xenium_ingest"
+desc = "Ingest a Xenium output bundle (cell_feature_matrix.h5 + cells table) into engine-readable tables"
+doc = """
+输入：Xenium cell_feature_matrix.h5（10x 风格 CSR，input0）+ cells 表
+（parquet/csv/tsv，input1；含 centroid 坐标等逐细胞元数据）。
+输出三件：
+1) xenium_counts.parquet —— cells × genes 整数计数矩阵（parquet，DAG 可直接读）；
+2) xenium_cells.tsv —— cell_id 与全部非列表元数据列（含 x/y centroid）；
+3) xenium_gene_stats.tsv —— gene/total_counts/n_cells/probe_class，其中
+   probe_class 标注 NegControlCode、UnassignedCode、Deprecated 等背景探针——
+   这是 §15.5 的 panel 覆盖与背景探针核验起点。
+失败处理：h5 内无 /matrix、cells 无 cell_id 或坐标列 → 退出 2。
+解释边界：计数是原始 UMI 聚合，不做分割/去卷积复算；负控探针不参与
+下游定量，只作 QC 参考。
+"""
+timeout_secs = 7200
+artifact_prefix = "/artifacts/xenium_ingest"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "xenium_counts.parquet", format = "xenium_counts" },
+  { path = "xenium_cells.tsv", format = "xenium_cells" },
+  { path = "xenium_gene_stats.tsv", format = "xenium_gene_stats" },
+  { path = "xenium_ingest.log", format = "xenium_log" },
+]
+
+[nodes.params]
+cells_format = { type = "string", default = "parquet", doc = "cells table format: parquet | csv | tsv" }
+x_col = { type = "string", default = "x_centroid", doc = "cells column for x coordinate" }
+y_col = { type = "string", default = "y_centroid", doc = "cells column for y coordinate" }
+
+[nodes.command]
+interpreter = "python3"
+script_file = "scripts/xenium_ingest.py"
+
+[nodes.command.env]
+XN_CELLS_FORMAT = "{{ cells_format }}"
+XN_X_COL = "{{ x_col }}"
+XN_Y_COL = "{{ y_col }}"
+
+[nodes.resources]
+network = "isolated"
+cpus = 4
+memory = "8g"
+pull_policy = "never"
+
+[[nodes]]
+kind = "spatial_nhood"
+desc = "Label-neighborhood enrichment on spatial coordinates with label permutation null"
+doc = """
+输入：细胞表 TSV（含坐标列与标签列——细胞类型注释或组织区域分区）。
+输出：nhood_enrichment.tsv（label_a/label_b/count/expected_mean/expected_sd/
+z/p_upper/p_lower）+ spatial_nhood.log。
+规则来源：方案 §15.5 第 4 条——组织内置换保留空间自相关（只打散标签，
+不动坐标/图结构）；经验 P=(b+1)/(B+1)。每对标签报告双侧两个方向。
+统计口径：kNN 图（n_neighbors 默认 6，含自身则 7 邻居实现差异已吸收）；
+计数是"标签对出现在邻接边的次数"。
+解释边界：这是切片内统计；供者是独立单位，跨供者家数汇总与家族错误率
+控制在下游节点。空间邻近支持相互作用可能性，不证明细胞迁移或通讯
+（§15.5 第 5 条）。
+失败处理：列缺失/标签全同 → 退出 2。
+"""
+timeout_secs = 7200
+artifact_prefix = "/artifacts/spatial_nhood"
+
+[nodes.ports]
+inputs = [{ type = "file" }]
+outputs = [
+  { path = "nhood_enrichment.tsv", format = "nhood_enrichment" },
+  { path = "spatial_nhood.log", format = "nhood_log" },
+]
+
+[nodes.params]
+x_col = { type = "string", default = "x_centroid", doc = "column with x coordinate" }
+y_col = { type = "string", default = "y_centroid", doc = "column with y coordinate" }
+label_col = { type = "string", default = "celltype", doc = "column with label (annotation/domain)" }
+n_neighbors = { type = "int", default = 6, min = 1.0, doc = "kNN neighbors per cell (excluding self)" }
+n_perm = { type = "int", default = 1000, min = 100.0, doc = "label permutation iterations; empirical p=(b+1)/(B+1)" }
+seed = { type = "int", default = 42, doc = "RNG seed" }
+
+[nodes.command]
+interpreter = "python3"
+script_file = "scripts/spatial_nhood.py"
+
+[nodes.command.env]
+NH_X_COL = "{{ x_col }}"
+NH_Y_COL = "{{ y_col }}"
+NH_LABEL_COL = "{{ label_col }}"
+NH_K = "{{ n_neighbors }}"
+NH_PERM = "{{ n_perm }}"
+NH_SEED = "{{ seed }}"
+
+[nodes.resources]
+network = "isolated"
+cpus = 4
+memory = "8g"
+pull_policy = "never"
+
+[[nodes]]
+kind = "imzml_ingest"
+desc = "Ingest imzML+ibd spatial metabolomics into pixel TIC table and optional m/z window intensities"
+doc = """
+输入：预处理 imzML（input0）+ 配对 ibd（input1）。脚本先按内容特征区分
+两个文件并复制成同基名对，再交给 pyimzML 解析。
+输出：
+1) msi_pixels.tsv —— pixel_id/x/y/n_peaks/tic（逐像素总离子流）；
+2) msi_windows.tsv —— mz_windows 参数给定时，每窗口的 mean/max/检出像素数；
+   未给定时只含表头并在 log 说明（空表仍是合法输出，供 DAG 引用存在性）。
+参数 mz_windows 用 JSON 数组字符串，形如
+ '[{"label":"mLPC_184","lo":184.07,"hi":184.09},{"label":"heme_616","lo":616.1,"hi":616.3}]'。
+规则来源：方案 §15.5 第 3 条——先核验预处理、同位素/加合物与注释置信度；
+本节点不做注释，只按给定 m/z 窗取强度。解释边界：峰强度是测量信号，
+不等于通量/分泌率（§15.5 第 5 条）。像素嵌套于切片，切片嵌套于供者；
+跨器官相关仅在同一患者配对成立时在下游估计。
+失败处理：imzML/ibd 无法配对或解析异常 → 退出 2；窗口 JSON 非法 → 退出 2。
+"""
+timeout_secs = 14400
+artifact_prefix = "/artifacts/imzml_ingest"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "msi_pixels.tsv", format = "msi_pixels" },
+  { path = "msi_windows.tsv", format = "msi_windows" },
+  { path = "imzml_ingest.log", format = "imzml_log" },
+]
+
+[nodes.params]
+mz_windows = { type = "string", optional = true, doc = "JSON array of {label,lo,hi} m/z windows; empty = TIC only" }
+
+[nodes.command]
+interpreter = "python3"
+script_file = "scripts/imzml_ingest.py"
+
+[nodes.command.env]
+MZ_WINDOWS_JSON = "{{ mz_windows }}"
+
+[nodes.resources]
+network = "isolated"
+cpus = 4
+memory = "8g"
+pull_policy = "never"
