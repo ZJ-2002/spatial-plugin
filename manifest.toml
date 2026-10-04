@@ -20,7 +20,7 @@ doc = """
 indptr 按细胞列、barcodes 逐细胞，input0）+ cells 表（parquet/csv/tsv，
 input1；含 centroid 坐标等逐细胞元数据）。
 矩阵按 CSC 直读后转成 cells×genes；counts 行与 cells 行的关联来自
-/Matrix/barcodes 与 cells 表 barcode 列（barcode_col，默认 cell_id）的
+/matrix/barcodes 与 cells 表 barcode 列（barcode_col，默认 cell_id）的
 严格对齐，不是行号——同长度不同顺序也对得上。
 输出三件：
 1) xenium_counts.parquet —— cells × genes 整数计数矩阵（行序随 cells 表）；
@@ -71,15 +71,21 @@ pull_policy = "never"
 
 [[nodes]]
 kind = "spatial_nhood"
-desc = "Label-neighborhood enrichment on spatial coordinates with label permutation null"
+desc = "Label-neighborhood enrichment on spatial coordinates with label permutation null (sparse, block-restricted option)"
 doc = """
-输入：细胞表 TSV（含坐标列与标签列——细胞类型注释或组织区域分区）。
+输入：细胞表 TSV（含坐标列与标签列——细胞类型注释或组织区域分区；
+可选块列 donor/slice/domain）。
 输出：nhood_enrichment.tsv（label_a/label_b/count/expected_mean/expected_sd/
 z/p_upper/p_lower）+ spatial_nhood.log。
-规则来源：方案 §15.5 第 4 条——组织内置换保留空间自相关（只打散标签，
-不动坐标/图结构）；经验 P=(b+1)/(B+1)。每对标签报告双侧两个方向。
-统计口径：kNN 图（n_neighbors 默认 6，含自身则 7 邻居实现差异已吸收）；
-计数是"标签对出现在邻接边的次数"。
+零模型口径（诚实化）：置换只打散标签、不动坐标与 kNN 图。全局置换
+（不给 block_column）是"全切片标签可交换"零假设——不保留标签的空间
+自相关，log 打显式 WARN；给 block_column（donor/slice/domain 列名）时
+置换只在块内交换，不跨块混合，块内标签组成不变（也不保留块内空间
+自相关，log 有注记）。经验 P=(b+1)/(B+1)。每对标签报告双侧两个方向。
+统计口径：kNN 图（n_neighbors 默认 6，不含自身）；计数是"标签对出现
+在无向邻接边的次数"，每边一次，同标签对角只计一次。
+实现：kNN 图与计数全部在 scipy.sparse/O(n·k) 边表上进行，无 n×n
+稠密分配（观测统计量与 P 公式与历史版本一致）。
 解释边界：这是切片内统计；供者是独立单位，跨供者家数汇总与家族错误率
 控制在下游节点。空间邻近支持相互作用可能性，不证明细胞迁移或通讯
 （§15.5 第 5 条）。
@@ -102,6 +108,7 @@ label_col = { type = "string", default = "celltype", doc = "column with label (a
 n_neighbors = { type = "int", default = 6, min = 1.0, doc = "kNN neighbors per cell (excluding self)" }
 n_perm = { type = "int", default = 1000, min = 100.0, doc = "label permutation iterations; empirical p=(b+1)/(B+1)" }
 seed = { type = "int", default = 42, doc = "RNG seed" }
+block_column = { type = "string", optional = true, doc = "column (donor/slice/domain) restricting label permutation to within-block exchange; empty = global permutation with explicit WARN" }
 
 [nodes.command]
 interpreter = "python3"
@@ -114,6 +121,7 @@ NH_LABEL_COL = "{{ label_col }}"
 NH_K = "{{ n_neighbors }}"
 NH_PERM = "{{ n_perm }}"
 NH_SEED = "{{ seed }}"
+NH_BLOCK_COL = "{{ block_column }}"
 
 [nodes.resources]
 network = "isolated"
@@ -138,6 +146,8 @@ doc = """
 不等于通量/分泌率（§15.5 第 5 条）。像素嵌套于切片，切片嵌套于供者；
 跨器官相关仅在同一患者配对成立时在下游估计。
 失败处理：imzML/ibd 无法配对或解析异常 → 退出 2；窗口 JSON 非法 → 退出 2。
+注记：窗口输出的口径语义（mean/max/检出像素的窗边界含否等）经 2026-10
+审计列为范围外，本轮未改动。
 """
 timeout_secs = 14400
 artifact_prefix = "/artifacts/imzml_ingest"
