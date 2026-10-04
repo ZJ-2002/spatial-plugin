@@ -16,15 +16,22 @@ license = "BSD-3-Clause"
 kind = "xenium_ingest"
 desc = "Ingest a Xenium output bundle (cell_feature_matrix.h5 + cells table) into engine-readable tables"
 doc = """
-输入：Xenium cell_feature_matrix.h5（10x 风格 CSR，input0）+ cells 表
-（parquet/csv/tsv，input1；含 centroid 坐标等逐细胞元数据）。
+输入：Xenium cell_feature_matrix.h5（官方 10x CSC 布局：shape=(genes,cells)、
+indptr 按细胞列、barcodes 逐细胞，input0）+ cells 表（parquet/csv/tsv，
+input1；含 centroid 坐标等逐细胞元数据）。
+矩阵按 CSC 直读后转成 cells×genes；counts 行与 cells 行的关联来自
+/Matrix/barcodes 与 cells 表 barcode 列（barcode_col，默认 cell_id）的
+严格对齐，不是行号——同长度不同顺序也对得上。
 输出三件：
-1) xenium_counts.parquet —— cells × genes 整数计数矩阵（parquet，DAG 可直接读）；
-2) xenium_cells.tsv —— cell_id 与全部非列表元数据列（含 x/y centroid）；
+1) xenium_counts.parquet —— cells × genes 整数计数矩阵（行序随 cells 表）；
+2) xenium_cells.tsv —— cell_id 与全部非列表元数据列（含 x/y centroid，
+   donor/slice 等身份列原样保真）；
 3) xenium_gene_stats.tsv —— gene/total_counts/n_cells/probe_class，其中
    probe_class 标注 NegControlCode、UnassignedCode、Deprecated 等背景探针——
    这是 §15.5 的 panel 覆盖与背景探针核验起点。
-失败处理：h5 内无 /matrix、cells 无 cell_id 或坐标列 → 退出 2。
+失败处理：h5 内无 /matrix 或无 barcodes、indptr 与官方 CSC 布局不符、
+cells 无 cell_id/坐标/barcode 列、h5 或 cells 侧 barcode 重复、
+两侧 barcode 集合不一致（缺失/多余）→ 退出 2。
 解释边界：计数是原始 UMI 聚合，不做分割/去卷积复算；负控探针不参与
 下游定量，只作 QC 参考。
 """
@@ -44,6 +51,7 @@ outputs = [
 cells_format = { type = "string", default = "parquet", doc = "cells table format: parquet | csv | tsv" }
 x_col = { type = "string", default = "x_centroid", doc = "cells column for x coordinate" }
 y_col = { type = "string", default = "y_centroid", doc = "cells column for y coordinate" }
+barcode_col = { type = "string", default = "cell_id", doc = "cells column holding /matrix/barcodes values; strict barcode alignment (duplicates/mismatches are hard errors)" }
 
 [nodes.command]
 interpreter = "python3"
@@ -53,6 +61,7 @@ script_file = "scripts/xenium_ingest.py"
 XN_CELLS_FORMAT = "{{ cells_format }}"
 XN_X_COL = "{{ x_col }}"
 XN_Y_COL = "{{ y_col }}"
+XN_BARCODE_COL = "{{ barcode_col }}"
 
 [nodes.resources]
 network = "isolated"
