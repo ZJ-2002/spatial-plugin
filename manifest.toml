@@ -2,7 +2,7 @@ schema_version = 1
 plugin_name = "spatial"
 
 [image]
-reference = "localhost/autonomics/biotools-py@sha256:21e14c1582a9d4c261c0a23a11864293313ee2b49b9b7d85bcabc89210b48c7e"
+reference = "ghcr.io/zj-2002/biotools-py@sha256:7ad6aeafa87672699d28b61b6bed12fc81fcdbfc43222a0abf17e2d56fb806f5"
 tag = "v1"
 upstream = "h5py + pyarrow + pyimzML + scikit-learn"
 license = "BSD-3-Clause"
