@@ -235,3 +235,77 @@ def test_single_label_fails(tmp_path):
     result, _, _ = run_nhood(tmp_path)
     assert result.returncode == 2
     assert "fewer than 2 distinct labels" in result.stderr
+
+
+# --- fix-review R08（2026-10-05）：block 必须同时限制建图，不只限制置换 ---
+
+def r08_coords():
+    """评审原始反例坐标：两切片各 3 细胞，切片 2 每点横坐标 +0.1。
+
+    不分块时每点的全局最近邻都是另一切片的对应点（距 0.1 < 切片内 10）
+    → k=1 的 3 条边全为跨切片；分块后应为两段链内边。
+    """
+    return np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0],
+                     [0.1, 0.0], [10.1, 0.0], [20.1, 0.0]])
+
+
+def edge_set(ei, ej):
+    return {(int(a), int(b)) for a, b in zip(ei.tolist(), ej.tolist())}
+
+
+def test_build_edges_without_blocks_is_cross_slice_r08():
+    # 无 block（v2/v3 行为一致）：全局 k=1 的 3 条边全为跨切片
+    # (0,3),(1,4),(2,5)——这正是评审指出的问题形态。
+    module = load_module()
+    ei, ej = module.build_edges(r08_coords(), 1)
+    assert edge_set(ei, ej) == {(0, 3), (1, 4), (2, 5)}
+
+
+def test_build_edges_blocks_restrict_graph_within_slice_r08():
+    # fix-review R08 修复本体：给 block 后逐块建 kNN——两段切片内链
+    # {0,1},{1,2} 与 {3,4},{4,5}，零跨切片边。
+    module = load_module()
+    blocks = np.array(["S1"] * 3 + ["S2"] * 3)
+    ei, ej = module.build_edges(r08_coords(), 1, blocks)
+    assert edge_set(ei, ej) == {(0, 1), (1, 2), (3, 4), (4, 5)}
+    # 块序确定性：块标签换序（值同集合）结果一致。
+    blocks_renamed = np.array(["B"] * 3 + ["A"] * 3)
+    ei2, ej2 = module.build_edges(r08_coords(), 1, blocks_renamed)
+    assert edge_set(ei, ej) == edge_set(ei2, ej2)
+
+
+def test_blocked_end_to_end_no_cross_slice_edges_r08(tmp_path):
+    # 端到端：同反例坐标 + block_column → 观测计数里不可能出现跨切片
+    # 才有的标签对（S1 全 A、S2 全 B 时 A-B 边数为 0）。
+    coords = r08_coords()
+    frame = pd.DataFrame({
+        "x": coords[:, 0], "y": coords[:, 1],
+        "label": ["A"] * 3 + ["B"] * 3,
+        "slice": ["S1"] * 3 + ["S2"] * 3,
+    })
+    table = tmp_path / "cells.tsv"
+    frame.to_csv(table, sep="\t", index=False)
+    result, out, log = run_nhood(
+        tmp_path, env_extra={"NH_BLOCK_COL": "slice", "NH_K": "1",
+                             "NH_PERM": "100"})
+    assert result.returncode == 0, result.stderr
+    assert "perm_scope=within-block" in log
+    row = out[(out["label_a"] == "A") & (out["label_b"] == "B")].iloc[0]
+    assert int(row["count"]) == 0  # 无跨切片边；v2 此处 count=3
+
+
+def test_small_block_reduces_effective_k_with_warn(tmp_path):
+    # 块内细胞数 < k+1：有效 k 缩小并 WARN（诚实化，不静默降 k）。
+    coords = np.array([[0.0, 0.0], [1.0, 0.0], [100.0, 0.0], [101.0, 0.0]])
+    frame = pd.DataFrame({
+        "x": coords[:, 0], "y": coords[:, 1],
+        "label": ["A", "B", "A", "B"],
+        "slice": ["S1", "S1", "S2", "S2"],
+    })
+    table = tmp_path / "cells.tsv"
+    frame.to_csv(table, sep="\t", index=False)
+    result, _, _ = run_nhood(
+        tmp_path, env_extra={"NH_BLOCK_COL": "slice", "NH_K": "4",
+                             "NH_PERM": "100"})
+    assert result.returncode == 0, result.stderr
+    assert "effective k reduced" in result.stderr

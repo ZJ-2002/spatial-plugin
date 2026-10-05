@@ -8,6 +8,11 @@
 #    零假设口径诚实化：全局置换是"全切片标签可交换"零假设——它不保留标签
 #    的空间自相关（这正是零模型的本意），日志打显式 WARN；提供 block_column
 #    时置换只在块内交换，不跨块混合，块内标签组成保持不变。
+# 3) fix-review R08（v3）：block_column 同时限制**建图**——逐块建 kNN 再并
+#    回全局索引，合并多切片输入得到各切片内的图，不产生跨切片边（v2 的
+#    block 只限制置换：两切片坐标贴近时 k=1 建出的边全为跨切片）。块内
+#    细胞数 < k+1 时有效 k 缩小并 WARN。块内标签交换只保持标签数量，仍不
+#    保持块内空间自相关（零模型本意，日志照记）。
 # 统计口径不变（观测统计量定义与置换 P 公式均未改）：kNN 邻接（不含自身，
 # k+1 取邻居后去自身），无向边每边计一次（i<j）；同标签对角只计一次；
 # 经验 P=(b+1)/(B+1)，双侧各报 p_upper/p_lower；z 用 ddof=1 的置换 SD。
@@ -38,17 +43,22 @@ def fail(message):
     sys.exit(2)
 
 
-def build_edges(coords, k):
-    """kNN 无向边表：(ei, ej) 且 ei<ej，每边恰一次。
+def _knn_edges(coords, k):
+    """单（块内）坐标集的 kNN 无向边（局部索引，ei<ej，每边恰一次）。
 
-    kNN 图以 scipy.sparse 稠密化前的三元组建 csr，邻接对称化与去重
-    （triu 取 i<j 侧）都是稀疏运算；返回排序后的边端点数组，
-    全程内存 O(n·k)，无 n×n 分配。
+    n_neighbors 取 min(k+1, n)：块内细胞数不足 k+1 时按实际数取邻居
+    （有效 k 缩到 n-1，由调用方 WARN）。稀疏实现：三元组建 csr，邻接
+    对称化与去重（triu 取 i<j 侧）都是稀疏运算，内存 O(n·k)。
     """
     n = coords.shape[0]
-    nn = NearestNeighbors(n_neighbors=k + 1).fit(coords)
+    if n < 2 or k < 1:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    nn = NearestNeighbors(n_neighbors=min(k + 1, n)).fit(coords)
     _, neighbors = nn.kneighbors(coords)
-    rows = np.repeat(np.arange(n), k)
+    width = neighbors.shape[1] - 1
+    if width < 1:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    rows = np.repeat(np.arange(n), width)
     cols = neighbors[:, 1:].ravel()  # 去掉首列自身
     directed = sp.csr_matrix(
         (np.ones(len(rows), dtype=np.int8), (rows, cols)), shape=(n, n)
@@ -58,6 +68,29 @@ def build_edges(coords, k):
     upper = sp.triu(undirected, k=1)  # 每条无向边保留 i<j 一侧
     ei, ej = upper.nonzero()
     return ei.astype(np.int64), ej.astype(np.int64)
+
+
+def build_edges(coords, k, blocks=None):
+    """kNN 无向边表：(ei, ej) 且 ei<ej，每边恰一次。
+
+    blocks 为 None 时全表一次 kNN；给定块列时**逐块**建 kNN 再并回
+    全局索引（fix-review R08）——块内各点只与本块近邻连边，合并多
+    切片输入得到的是各切片内的图，不产生跨切片边（v2 的 block 只
+    限制置换、不限制建图：两切片坐标贴近时 k=1 建出的边全为跨切片）。
+    块序为排序后的块标签序，同 seed 确定。
+    """
+    if blocks is None:
+        return _knn_edges(coords, k)
+    ei_parts, ej_parts = [], []
+    for block in sorted(set(blocks.tolist())):
+        idx = np.flatnonzero(blocks == block)
+        local_ei, local_ej = _knn_edges(coords[idx], k)
+        ei_parts.append(idx[local_ei])
+        ej_parts.append(idx[local_ej])
+    if not ei_parts:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return (np.concatenate(ei_parts).astype(np.int64),
+            np.concatenate(ej_parts).astype(np.int64))
 
 
 def pair_counts(code, ei, ej, n_levels):
@@ -109,8 +142,18 @@ def main():
     blocks = None
     if BLOCK_COL:
         blocks = table[BLOCK_COL].astype(str).to_numpy()
+        # 块内细胞数不足 k+1 时有效 k 缩小——如实 WARN（fix-review R08）。
+        for block in sorted(set(blocks.tolist())):
+            block_n = int((blocks == block).sum())
+            if block_n < K + 1:
+                print(
+                    f"WARN: block {block!r} has {block_n} cells < k+1={K + 1}; "
+                    "each cell connects to at most block_n-1 within-block neighbors "
+                    "(effective k reduced)",
+                    file=sys.stderr,
+                )
 
-    ei, ej = build_edges(coords, K)
+    ei, ej = build_edges(coords, K, blocks)
 
     observed = pair_counts(code, ei, ej, L)
 

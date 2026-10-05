@@ -12,8 +12,8 @@ B-S 空间组学摄取与邻域统计（主计划 §15.5）。三个节点共享
 | `imzml_ingest` | imzML + ibd | `msi_pixels.tsv`（pixel_id/x/y/n_peaks/tic）、`msi_windows.tsv` | §15.5-3 空间代谢 |
 
 参数见各自 manifest（xenium: `cells_format`/`x_col`/`y_col`/`barcode_col`；
-nhood: `n_neighbors`=6/`n_perm`=1000/`seed`/`block_column`（块内置换，
-缺省全局置换并打 WARN）；imzml: `mz_windows` JSON，如
+nhood: `n_neighbors`=6/`n_perm`=1000/`seed`/`block_column`（块内**建图+**
+**置换**，缺省全局图+全局置换并打 WARN）；imzml: `mz_windows` JSON，如
 `[{"label":"mLPC_184","lo":184.07,"hi":184.08}]`）。
 
 ## 布局
@@ -34,7 +34,11 @@ spatial/
 - **nhood 置换只打散标签、坐标与邻接图不动**；经验 P=(b+1)/(B+1)，
   双侧 p_upper/p_lower；无向边计数 i<j、同标签对角只计一次。
   零假设口径：全局置换=全切片标签可交换，**不保留标签空间自相关**
-  （log 显式 WARN）；`block_column` 给定时只在块内交换（跨切片不混合）。
+  （log 显式 WARN）；`block_column` 给定时**建图与置换都在块内**
+  （fix-review R08：逐块建 kNN 并回全局索引，合并多切片输入得到各
+  切片内的图，不产生跨切片边；v2 只限制置换——两切片坐标贴近时
+  k=1 的边全为跨切片。块内细胞数 < k+1 时有效 k 缩小并 WARN）。
+  块内置换只保持标签数量，仍不保留块内空间自相关（零模型本意）。
   实现全程稀疏（kNN 图 scipy.sparse + O(n·k) 边表计数），无 n×n
   稠密分配。
 - **probe_class** 列标出 NegControlCode/NegControlProbe/UnassignedCode/
